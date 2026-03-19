@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "screen-capture": {
+      "command": "/Users/paul/github/screen-capture-mcp/cpp/build/screen-capture-mcp",
+      "args": []
+    }
+  }
+}
