@@ -1,39 +1,125 @@
-# Screen Capture MCP
+# Screen Capture MCP Server
 
-A macOS-native MCP server that gives AI agents the ability to capture screenshots. Built with C++20/ObjC++20 using ScreenCaptureKit. Designed for claude-code feedback loops while cross-developing applications.
+A macOS-native MCP server that gives AI agents the ability to capture screenshots. Built with C++20/ObjC++20 using ScreenCaptureKit. Designed for Claude Code feedback loops while cross-developing applications.
 
-## Tools
+## Features
 
-- **`list_displays`** — Enumerate displays (index, resolution, main flag)
-- **`capture_screen`** — Screenshot a display or sub-region; returns PNG image. Params: `display_index`, `x`, `y`, `width`, `height`
-- **`capture_window`** — Screenshot a window by app name (case-insensitive substring). Params: `app_name` (required), `window_title`
+| Tool | Description |
+|------|-------------|
+| **`list_displays`** | Discover available displays with index, resolution, and main display flag |
+| **`capture_screen`** | Capture a full display or sub-region, returned as a base64 PNG that Claude can see directly |
+| **`capture_window`** | Capture a specific application window by name, returned as a base64 PNG |
+
+## Prerequisites
+
+- **macOS 14+** (Sonoma or later)
+- **Xcode Command Line Tools** — `xcode-select --install`
+- **CMake** — `brew install cmake`
 
 ## Build
 
-```sh
-cd cpp
-cmake -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build
+```bash
+make build
 ```
 
-Binary: `cpp/build/screen-capture-mcp`
+This runs CMake and compiles the native binary to `cpp/build/screen-capture-mcp`.
 
-## Setup
+Other targets: `make clean`, `make rebuild`.
 
-Add to your `.mcp.json`:
+## Configuration
+
+### Claude Code (project-scoped)
+
+The repo includes `.mcp.json` — just clone and build:
 
 ```json
 {
   "mcpServers": {
     "screen-capture": {
-      "command": "/path/to/cpp/build/screen-capture-mcp",
-      "args": []
+      "command": "./cpp/build/screen-capture-mcp"
     }
   }
 }
 ```
 
-**Requires macOS 14.0+** and Screen Recording permission granted to the host process (System Settings > Privacy & Security > Screen Recording).
+### Claude Code (global)
+
+To make the server available in all sessions regardless of working directory:
+
+```bash
+claude mcp add --transport stdio --scope user screen-capture /path/to/screen-capture-mcp/cpp/build/screen-capture-mcp
+```
+
+### Claude Desktop
+
+Add to `~/Library/Application Support/Claude/claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "screen-capture": {
+      "command": "/path/to/screen-capture-mcp/cpp/build/screen-capture-mcp"
+    }
+  }
+}
+```
+
+### Screen Recording Permission
+
+On first use, macOS will prompt for screen recording access. The terminal app running the MCP server (Terminal, iTerm2, etc.) must be granted permission in **System Settings > Privacy & Security > Screen Recording**.
+
+## Tool Reference
+
+### `list_displays`
+
+No parameters. Returns an array of displays with `index`, `display_id`, `name`, `width`, `height`, and `is_main` fields.
+
+### `capture_screen`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `display_index` | integer | `0` | Display index from `list_displays` |
+| `x` | integer | — | Region X offset (optional) |
+| `y` | integer | — | Region Y offset (optional) |
+| `width` | integer | — | Region width (optional) |
+| `height` | integer | — | Region height (optional) |
+
+Returns a base64-encoded PNG image inline that Claude can see directly. When `x`/`y`/`width`/`height` are provided, captures only that sub-region of the display.
+
+### `capture_window`
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `app_name` | string | *(required)* | Application name (case-insensitive substring match) |
+| `window_title` | string | — | Window title filter (case-insensitive substring, optional) |
+
+Returns a base64-encoded PNG of the matched window.
+
+## Usage Examples
+
+### Discover displays
+
+> "What displays are connected to this machine?"
+
+Claude calls `list_displays` and returns a list of displays with their resolutions and which is the main display.
+
+### Capture a screenshot
+
+> "Take a screenshot of my main display"
+
+Claude calls `capture_screen` with `display_index=0` and receives a PNG image it can see and describe.
+
+### Capture a region
+
+> "Screenshot the top-left 800x600 corner of my screen"
+
+Claude calls `capture_screen` with `x=0`, `y=0`, `width=800`, `height=600`.
+
+### Capture an app window
+
+> "Show me what Safari looks like right now"
+
+Claude calls `capture_window` with `app_name="Safari"` and receives a PNG of the Safari window.
 
 ## Architecture
 
@@ -82,3 +168,7 @@ XPC thread (system):  completion handlers fire here
                       -> signals semaphore
 Background thread:    semaphore unblocks, returns C++ data to MCP response
 ```
+
+## License
+
+BSD 2-Clause. See [LICENSE](LICENSE).
