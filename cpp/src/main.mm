@@ -15,7 +15,7 @@ int main() {
     // Initialize NSApplication so AppKit/ScreenCaptureKit work in a CLI tool.
     [NSApplication sharedApplication];
 
-    __block McpServer server("screen-capture", "1.0.0");
+    __block McpServer server("screen-capture", "1.1.0");
 
     // ── list_displays ─────────────────────────────────────────────────
     server.add_tool(
