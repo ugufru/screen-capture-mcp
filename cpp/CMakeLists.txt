@@ -25,6 +25,8 @@ target_link_libraries(screen-capture-mcp PRIVATE
     nlohmann_json::nlohmann_json
     "-framework ScreenCaptureKit"
     "-framework CoreGraphics"
+    "-framework CoreMedia"
+    "-framework CoreVideo"
     "-framework Foundation"
     "-framework ImageIO"
     "-framework UniformTypeIdentifiers"

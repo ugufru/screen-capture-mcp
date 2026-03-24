@@ -5,9 +5,64 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import <AppKit/AppKit.h>
 
+#import <CoreMedia/CoreMedia.h>
+#import <CoreVideo/CoreVideo.h>
+
 #include "screen_capture.h"
 
 #include <stdexcept>
+
+// ── SCStream single-frame delegate ──────────────────────────────────────
+
+@interface SingleFrameCapture : NSObject <SCStreamOutput>
+@property (nonatomic, strong) dispatch_semaphore_t semaphore;
+@property (nonatomic, assign) CGImageRef capturedImage;
+@end
+
+@implementation SingleFrameCapture
+
+- (void)stream:(SCStream*)stream
+    didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
+                   ofType:(SCStreamOutputType)type {
+    if (type != SCStreamOutputTypeScreen) return;
+    if (self.capturedImage) return; // first frame only
+
+    CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!pixelBuffer) return;
+
+    size_t w = CVPixelBufferGetWidth(pixelBuffer);
+    size_t h = CVPixelBufferGetHeight(pixelBuffer);
+
+    CVPixelBufferLockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+    void* base = CVPixelBufferGetBaseAddress(pixelBuffer);
+    size_t bpr = CVPixelBufferGetBytesPerRow(pixelBuffer);
+
+    CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+    CGContextRef ctx = CGBitmapContextCreate(
+        base, w, h, 8, bpr, cs,
+        kCGBitmapByteOrder32Little | (uint32_t)kCGImageAlphaPremultipliedFirst);
+    CGColorSpaceRelease(cs);
+
+    if (ctx) {
+        self.capturedImage = CGBitmapContextCreateImage(ctx);
+        CGContextRelease(ctx);
+    }
+
+    CVPixelBufferUnlockBaseAddress(pixelBuffer, kCVPixelBufferLock_ReadOnly);
+
+    dispatch_semaphore_signal(self.semaphore);
+}
+
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wobjc-missing-super-calls"
+- (void)dealloc {
+    if (_capturedImage) {
+        CGImageRelease(_capturedImage);
+    }
+}
+#pragma clang diagnostic pop
+
+@end
 
 // ── helpers ──────────────────────────────────────────────────────────────
 
@@ -120,9 +175,8 @@ std::vector<DisplayInfo> list_displays() {
 ScreenCaptureResult capture_screen(int display_index,
                                    int x, int y,
                                    int region_width, int region_height) {
-    // Step 1: get shareable content and build filter/config inside callback
-    __block SCContentFilter* filter = nil;
-    __block SCStreamConfiguration* config = nil;
+    // Step 1: get display info from ScreenCaptureKit (for enumeration)
+    __block CGDirectDisplayID captured_display_id = 0;
     __block std::string display_name;
     __block std::string error_msg;
     dispatch_semaphore_t sem1 = dispatch_semaphore_create(0);
@@ -153,18 +207,7 @@ ScreenCaptureResult capture_screen(int display_index,
                 }
 
                 SCDisplay* display = displays[display_index];
-                filter = [[SCContentFilter alloc] initWithDisplay:display
-                                                  excludingWindows:@[]];
-                config = [[SCStreamConfiguration alloc] init];
-                config.width = display.width;
-                config.height = display.height;
-                config.showsCursor = NO;
-
-                if (region_width > 0 && region_height > 0) {
-                    config.sourceRect = CGRectMake(x, y, region_width, region_height);
-                    config.width = region_width;
-                    config.height = region_height;
-                }
+                captured_display_id = display.displayID;
 
                 // Get display name from NSScreen on main thread
                 dispatch_sync(dispatch_get_main_queue(), ^{
@@ -194,37 +237,16 @@ ScreenCaptureResult capture_screen(int display_index,
         throw std::runtime_error(error_msg);
     }
 
-    // Step 2: capture screenshot (filter/config are retained by ARC)
-    __block CGImageRef capturedImage = nil;
-    dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
-
-    [SCScreenshotManager captureImageWithFilter:filter
-                                  configuration:config
-                              completionHandler:
-        ^(CGImageRef image, NSError* error) {
-            if (image) {
-                capturedImage = image;
-                CGImageRetain(capturedImage);
-            }
-            if (error) {
-                error_msg = "Screenshot failed: " +
-                    nsstring_to_std(error.localizedDescription);
-            }
-            dispatch_semaphore_signal(sem2);
-        }];
-
-    wait = dispatch_semaphore_wait(sem2,
-        dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-    if (wait != 0) {
-        throw std::runtime_error(
-            "Timeout capturing screenshot. "
-            "Check System Settings > Privacy & Security > Screen Recording.");
-    }
-    if (!error_msg.empty()) {
-        throw std::runtime_error(error_msg);
+    // Step 2: capture using CoreGraphics (synchronous, no XPC needed)
+    CGImageRef capturedImage;
+    if (region_width > 0 && region_height > 0) {
+        CGRect region = CGRectMake(x, y, region_width, region_height);
+        capturedImage = CGDisplayCreateImageForRect(captured_display_id, region);
+    } else {
+        capturedImage = CGDisplayCreateImage(captured_display_id);
     }
     if (!capturedImage) {
-        throw std::runtime_error("No image captured");
+        throw std::runtime_error("Failed to capture display");
     }
 
     auto png = cgimage_to_png(capturedImage);
@@ -323,6 +345,7 @@ WindowCaptureResult capture_window(const std::string& app_name,
                 config.width = (size_t)matched.frame.size.width;
                 config.height = (size_t)matched.frame.size.height;
                 config.showsCursor = NO;
+                config.pixelFormat = kCVPixelFormatType_32BGRA;
             }
             dispatch_semaphore_signal(sem1);
         }];
@@ -338,37 +361,64 @@ WindowCaptureResult capture_window(const std::string& app_name,
         throw std::runtime_error(error_msg);
     }
 
-    // Step 2: capture screenshot
-    __block CGImageRef capturedImage = nil;
-    dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
+    // Step 2: capture via SCStream (grab first frame then stop)
+    // SCScreenshotManager's completion handler is unreliable in CLI processes
+    // on macOS 15. SCStream's frame delivery is more reliable.
+    SingleFrameCapture* frameCapture = [[SingleFrameCapture alloc] init];
+    frameCapture.semaphore = dispatch_semaphore_create(0);
 
-    [SCScreenshotManager captureImageWithFilter:filter
-                                  configuration:config
-                              completionHandler:
-        ^(CGImageRef image, NSError* err) {
-            if (image) {
-                capturedImage = image;
-                CGImageRetain(capturedImage);
-            }
-            if (err) {
-                error_msg = "Screenshot failed: " +
-                    nsstring_to_std(err.localizedDescription);
-            }
-            dispatch_semaphore_signal(sem2);
-        }];
+    NSError* streamError = nil;
+    SCStream* stream = [[SCStream alloc] initWithFilter:filter
+                                          configuration:config
+                                               delegate:nil];
+    [stream addStreamOutput:frameCapture
+                       type:SCStreamOutputTypeScreen
+          sampleHandlerQueue:dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0)
+                      error:&streamError];
+    if (streamError) {
+        throw std::runtime_error("Failed to configure stream: " +
+                                 nsstring_to_std(streamError.localizedDescription));
+    }
 
-    wait = dispatch_semaphore_wait(sem2,
+    // Start the stream
+    dispatch_semaphore_t startSem = dispatch_semaphore_create(0);
+    __block NSError* startError = nil;
+    [stream startCaptureWithCompletionHandler:^(NSError* error) {
+        startError = error;
+        dispatch_semaphore_signal(startSem);
+    }];
+
+    wait = dispatch_semaphore_wait(startSem,
         dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
     if (wait != 0) {
         throw std::runtime_error(
-            "Timeout capturing screenshot. "
+            "Timeout starting stream. "
             "Check System Settings > Privacy & Security > Screen Recording.");
     }
-    if (!error_msg.empty()) {
-        throw std::runtime_error(error_msg);
+    if (startError) {
+        throw std::runtime_error("Failed to start stream: " +
+                                 nsstring_to_std(startError.localizedDescription));
     }
+
+    // Wait for first frame
+    wait = dispatch_semaphore_wait(frameCapture.semaphore,
+        dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
+
+    // Stop the stream regardless
+    dispatch_semaphore_t stopSem = dispatch_semaphore_create(0);
+    [stream stopCaptureWithCompletionHandler:^(NSError*) {
+        dispatch_semaphore_signal(stopSem);
+    }];
+    dispatch_semaphore_wait(stopSem,
+        dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+
+    if (wait != 0) {
+        throw std::runtime_error("Timeout waiting for window frame");
+    }
+
+    CGImageRef capturedImage = frameCapture.capturedImage;
     if (!capturedImage) {
-        throw std::runtime_error("No image captured");
+        throw std::runtime_error("No image captured from stream");
     }
 
     auto png = cgimage_to_png(capturedImage);
@@ -378,6 +428,5 @@ WindowCaptureResult capture_window(const std::string& app_name,
     result.height = (int)CGImageGetHeight(capturedImage);
     result.window_title = matched_title;
     result.app_name = matched_app;
-    CGImageRelease(capturedImage);
     return result;
 }
